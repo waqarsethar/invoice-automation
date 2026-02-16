@@ -1,0 +1,271 @@
+name: Process Invoice from Issue
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  process-invoice:
+    if: contains(github.event.issue.labels.*.name, 'invoice')
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_DB: invoice_automation
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set up database tables
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -d invoice_automation -f scripts/setup_database.sql
+
+      - name: Extract PDF URL from issue body
+        id: extract
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body;
+
+            // Extract PDF URLs from the issue body (GitHub attachment format)
+            const pdfRegex = /https:\/\/github\.com\/user-attachments\/assets\/[^\s\)]+\.pdf|https:\/\/github\.com\/[^\s\)]+\/files\/[^\s\)]+\.pdf/gi;
+            // Also match the general GitHub user-content URLs
+            const altRegex = /https:\/\/github\.user-content\.com\/[^\s\)]+/gi;
+            // Match any URL ending in .pdf
+            const genericPdfRegex = /https?:\/\/[^\s\)]+\.pdf/gi;
+
+            let urls = [];
+            let match;
+
+            for (const regex of [pdfRegex, altRegex, genericPdfRegex]) {
+              while ((match = regex.exec(body)) !== null) {
+                if (!urls.includes(match[0])) {
+                  urls.push(match[0]);
+                }
+              }
+            }
+
+            if (urls.length === 0) {
+              core.setFailed('No PDF attachment found in the issue body');
+              return;
+            }
+
+            core.setOutput('pdf_url', urls[0]);
+            core.setOutput('pdf_count', urls.length);
+            console.log(`Found ${urls.length} PDF(s): ${urls.join(', ')}`);
+
+            // Extract vendor name from issue body
+            const vendorMatch = body.match(/### Vendor Name\s*\n\s*(.+)/);
+            const vendor = vendorMatch ? vendorMatch[1].trim() : 'Unknown';
+            core.setOutput('vendor', vendor);
+
+            // Extract PO number
+            const poMatch = body.match(/### PO Number\s*\n\s*(.+)/);
+            const po = poMatch ? poMatch[1].trim() : '';
+            core.setOutput('po_number', po);
+
+      - name: Download invoice PDF
+        run: |
+          mkdir -p /tmp/invoices
+          curl -L -o /tmp/invoices/invoice.pdf "${{ steps.extract.outputs.pdf_url }}"
+          echo "Downloaded PDF ($(wc -c < /tmp/invoices/invoice.pdf) bytes)"
+
+      - name: Process invoice
+        id: process
+        env:
+          DB_HOST: localhost
+          DB_NAME: invoice_automation
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+        run: |
+          python -c "
+          import json
+          import sys
+          from datetime import date
+          from decimal import Decimal
+          from pathlib import Path
+
+          from src.config_loader import DatabaseConfig, ValidationConfig
+          from src.database import DatabaseLoader
+          from src.models import InvoiceData, ValidationResult
+          from src.pdf_parser import PDFParser
+          from src.validator import InvoiceValidator
+
+          # Parse the PDF
+          pdf_path = Path('/tmp/invoices/invoice.pdf')
+          pdf_bytes = pdf_path.read_bytes()
+          print(f'PDF size: {len(pdf_bytes)} bytes')
+
+          parser = PDFParser()
+          try:
+              invoice = parser.parse(pdf_bytes, 'invoice.pdf')
+          except Exception as e:
+              print(f'::error::PDF parsing failed: {e}')
+              result = {'status': 'parse_error', 'error': str(e)}
+              Path('/tmp/result.json').write_text(json.dumps(result))
+              sys.exit(1)
+
+          print(f'Parsed invoice: {invoice.invoice_number}')
+          print(f'Vendor: {invoice.vendor_name}')
+          print(f'Amount: \${invoice.total_amount}')
+          print(f'Date: {invoice.invoice_date}')
+
+          # Validate
+          val_config = ValidationConfig(
+              max_invoice_amount=1_000_000,
+              min_invoice_amount=0.01,
+              po_numbers_file='config/po_numbers.csv',
+              approved_vendors_file='config/approved_vendors.csv',
+              max_invoice_age_days=365,
+          )
+          validator = InvoiceValidator(val_config)
+          validation = validator.validate(invoice)
+
+          # Store in database
+          db_config = DatabaseConfig(
+              host='localhost', port=5432,
+              name='invoice_automation', user='postgres', password='postgres',
+          )
+          stored = False
+          record_id = None
+          if validation.is_valid:
+              try:
+                  with DatabaseLoader(db_config) as db:
+                      db.create_tables()
+                      if db.check_duplicate(invoice.invoice_number):
+                          print(f'::warning::Duplicate invoice: {invoice.invoice_number}')
+                          result = {'status': 'duplicate', 'invoice_number': invoice.invoice_number}
+                      else:
+                          record_id = db.insert_invoice(invoice, email_from='github-issue', email_subject='Invoice upload')
+                          stored = True
+                          result = {
+                              'status': 'success',
+                              'invoice_number': invoice.invoice_number,
+                              'vendor': invoice.vendor_name,
+                              'amount': str(invoice.total_amount),
+                              'currency': invoice.currency,
+                              'date': str(invoice.invoice_date),
+                              'due_date': str(invoice.due_date) if invoice.due_date else None,
+                              'po_number': invoice.po_number,
+                              'record_id': record_id,
+                          }
+              except Exception as e:
+                  print(f'::error::Database error: {e}')
+                  result = {'status': 'db_error', 'error': str(e)}
+          else:
+              result = {
+                  'status': 'validation_failed',
+                  'invoice_number': invoice.invoice_number,
+                  'errors': validation.errors,
+                  'warnings': validation.warnings,
+              }
+
+          Path('/tmp/result.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+
+          if not validation.is_valid:
+              sys.exit(1)
+          "
+
+      - name: Comment on issue with results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let result;
+            try {
+              result = JSON.parse(fs.readFileSync('/tmp/result.json', 'utf8'));
+            } catch {
+              result = { status: 'error', error: 'Failed to read processing result' };
+            }
+
+            let comment = '';
+
+            if (result.status === 'success') {
+              comment = `### Invoice Processed Successfully\n\n` +
+                `| Field | Value |\n|---|---|\n` +
+                `| **Invoice #** | \`${result.invoice_number}\` |\n` +
+                `| **Vendor** | ${result.vendor} |\n` +
+                `| **Amount** | $${result.amount} ${result.currency} |\n` +
+                `| **Date** | ${result.date} |\n` +
+                `| **Due Date** | ${result.due_date || 'N/A'} |\n` +
+                `| **PO Number** | ${result.po_number || 'N/A'} |\n` +
+                `| **Record ID** | \`${result.record_id}\` |\n\n` +
+                `> Stored in database and ready for payment processing.`;
+            } else if (result.status === 'validation_failed') {
+              const errors = result.errors.map(e => `- ${e}`).join('\n');
+              const warnings = result.warnings ? result.warnings.map(w => `- ${w}`).join('\n') : '';
+              comment = `### Invoice Validation Failed\n\n` +
+                `**Invoice #:** \`${result.invoice_number}\`\n\n` +
+                `**Errors:**\n${errors}\n` +
+                (warnings ? `\n**Warnings:**\n${warnings}\n` : '') +
+                `\n> Please fix the issues and upload a corrected invoice.`;
+            } else if (result.status === 'duplicate') {
+              comment = `### Duplicate Invoice Detected\n\n` +
+                `Invoice \`${result.invoice_number}\` already exists in the database.\n\n` +
+                `> No action taken. Close this issue if this was intentional.`;
+            } else if (result.status === 'parse_error') {
+              comment = `### PDF Parsing Failed\n\n` +
+                `Could not extract invoice data from the uploaded PDF.\n\n` +
+                `**Error:** ${result.error}\n\n` +
+                `> Make sure the PDF contains readable text (not a scanned image).`;
+            } else {
+              comment = `### Processing Error\n\n` +
+                `An unexpected error occurred: ${result.error || 'Unknown'}\n\n` +
+                `> Please check the workflow logs for details.`;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment,
+            });
+
+            // Add status label
+            const label = result.status === 'success' ? 'processed' :
+                          result.status === 'duplicate' ? 'duplicate' :
+                          'failed';
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: [label],
+              });
+            } catch {
+              console.log('Could not add label (may need to create it first)');
+            }
+
+            // Close issue on success
+            if (result.status === 'success') {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                state: 'closed',
+              });
+            }

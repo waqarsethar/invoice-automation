@@ -1,0 +1,49 @@
+name: Upload Invoice
+description: Upload a PDF invoice for automated processing
+title: "[Invoice] "
+labels: ["invoice"]
+body:
+  - type: input
+    id: vendor_name
+    attributes:
+      label: Vendor Name
+      description: Name of the vendor/supplier
+      placeholder: e.g. Acme Corp
+    validations:
+      required: true
+
+  - type: input
+    id: po_number
+    attributes:
+      label: PO Number
+      description: Purchase order number (if applicable)
+      placeholder: e.g. PO-2024-100
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - Normal
+        - Urgent
+    validations:
+      required: true
+
+  - type: textarea
+    id: invoice_file
+    attributes:
+      label: Invoice PDF
+      description: Drag and drop your invoice PDF file here
+      placeholder: Drag and drop your PDF file into this area
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional Notes
+      description: Any extra context about this invoice
+    validations:
+      required: false

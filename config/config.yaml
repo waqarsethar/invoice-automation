@@ -1,0 +1,44 @@
+email:
+  imap_host: "imap.gmail.com"
+  imap_port: 993
+  search_subject: "Invoice"
+  folder: "INBOX"
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "invoice_automation"
+  user: "postgres"
+
+slack:
+  enabled: true
+
+retry:
+  max_attempts: 3
+  base_delay: 1.0
+  max_delay: 60.0
+  exponential_base: 2.0
+
+metrics:
+  enabled: false
+  port: 9090
+
+storage:
+  bucket_name: "invoice-archive"
+  region: "us-east-1"
+
+validation:
+  max_invoice_amount: 1000000.00
+  min_invoice_amount: 0.01
+  po_numbers_file: "config/po_numbers.csv"
+  approved_vendors_file: "config/approved_vendors.csv"
+  max_invoice_age_days: 365
+
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  max_bytes: 10485760
+  backup_count: 5
+  json_format: true
+
+dry_run: false
